@@ -1,0 +1,3 @@
+# Blacklist IP - indirizzi bloccati
+# Aggiunto automaticamente quando rilevato malevolo
+185.220.101.50  # Bloccato: 12 rilevamenti malevoli

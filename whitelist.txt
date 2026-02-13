@@ -1,5 +1,5 @@
-# Whitelist di IP - Aggiungi un IP per riga
-# Le righe che iniziano con # vengono ignorate
-127.0.0.1
+# Whitelist IP - indirizzi fidati
+192.168.1.1
+10.0.0.1
 8.8.8.8
 1.1.1.1
