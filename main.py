@@ -1,51 +1,154 @@
 #!/usr/bin/env python3
 """
-Main entry point for the application.
-A script that demonstrates data processing and configuration management.
+Script per filtrare indirizzi IP dalla whitelist e controllare quelli malevoli
 """
 
-import sys
-from pathlib import Path
+import ipaddress
+import re
+from typing import List, Set
+import time
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+try:
+    import requests
+except ImportError:
+    requests = None
 
-from config import Config
-from data_processor import DataProcessor
-from logger import setup_logger
+# Configurazione
+VIRUSTOTAL_API_KEY = "YOUR_API_KEY_HERE"  # Inserisci la tua chiave API di VirusTotal
+VIRUSTOTAL_URL = "https://www.virustotal.com/api/v3/ip_addresses/"
 
-logger = setup_logger(__name__)
+def carica_whitelist(file_path: str) -> Set[str]:
+    """Carica gli IP dalla whitelist"""
+    try:
+        with open(file_path, 'r') as f:
+            whitelist = {line.strip() for line in f if line.strip() and not line.startswith('#')}
+        print(f"✓ Caricati {len(whitelist)} IP dalla whitelist")
+        return whitelist
+    except FileNotFoundError:
+        print(f"⚠ File whitelist non trovato: {file_path}")
+        return set()
 
+def carica_ip_da_controllare(file_path: str) -> List[str]:
+    """Carica gli IP da controllare"""
+    try:
+        with open(file_path, 'r') as f:
+            ips = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        print(f"✓ Caricati {len(ips)} IP da controllare")
+        return ips
+    except FileNotFoundError:
+        print(f"⚠ File IP non trovato: {file_path}")
+        return []
+
+def valida_ip(ip: str) -> bool:
+    """Controlla se una stringa è un IP valido"""
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+def filtra_ip_non_whitelisted(ips: List[str], whitelist: Set[str]) -> List[str]:
+    """Filtra gli IP che non sono nella whitelist"""
+    ip_sospetti = []
+    for ip in ips:
+        if valida_ip(ip):
+            if ip not in whitelist:
+                ip_sospetti.append(ip)
+    
+    print(f"\n🔍 Trovati {len(ip_sospetti)} IP NON in whitelist (potenzialmente sospetti)")
+    return ip_sospetti
+
+def controlla_ip_malevolo_locale(ip: str) -> bool:
+    """
+    Controllo locale base per IP potenzialmente malevoli
+    (puoi aggiungere logica più sofisticata qui)
+    """
+    # Esempio: controlla se è un IP privato (di solito non malevolo)
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        if ip_obj.is_private:
+            return False
+        # Puoi aggiungere altre logiche qui
+        return True
+    except:
+        return False
+
+def visualizza_ip_malevoli(ip_malevoli: List[str]):
+    """Visualizza a video gli IP potenzialmente malevoli"""
+    if not ip_malevoli:
+        print("\n✓ Nessun IP malevolo trovato!")
+        return
+    
+    print("\n" + "="*60)
+    print("⚠️  IP POTENZIALMENTE MALEVOLI DA CONTROLLARE")
+    print("="*60)
+    for i, ip in enumerate(ip_malevoli, 1):
+        print(f"{i}. {ip}")
+    print("="*60)
+
+def controlla_su_virustotal(ip: str, api_key: str) -> dict:
+    """Controlla un IP su VirusTotal"""
+    if api_key == "YOUR_API_KEY_HERE":
+        print("⚠ Inserisci una chiave API valida per usare VirusTotal")
+        return None
+    
+    headers = {
+        "x-apikey": api_key
+    }
+    
+    try:
+        response = requests.get(f"{VIRUSTOTAL_URL}{ip}", headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            stats = data.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+            return stats
+        else:
+            print(f"⚠ Errore nella richiesta per {ip}: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"⚠ Errore durante il controllo di {ip}: {e}")
+        return None
 
 def main():
-    """Main function to run the application."""
-    logger.info("Starting application...")
+    print("="*60)
+    print("🛡️  IP MALICIOUS CHECKER")
+    print("="*60)
     
-    # Load configuration
-    config = Config()
-    logger.info(f"Loaded config: {config}")
+    # 1. Carica la whitelist
+    whitelist = carica_whitelist("whitelist.txt")
     
-    # Initialize data processor
-    processor = DataProcessor(config)
+    # 2. Carica gli IP da controllare
+    ips_da_controllare = carica_ip_da_controllare("ips_to_check.txt")
     
-    # Example: Process some data
-    sample_data = [
-        {"name": "Alice", "age": 28, "score": 85},
-        {"name": "Bob", "age": 35, "score": 92},
-        {"name": "Charlie", "age": 22, "score": 78},
-    ]
+    if not ips_da_controllare:
+        print("\n⚠ Nessun IP da controllare!")
+        return
     
-    logger.info("Processing sample data...")
-    results = processor.process(sample_data)
+    # 3. Filtra gli IP non in whitelist
+    ip_sospetti = filtra_ip_non_whitelisted(ips_da_controllare, whitelist)
     
-    # Display results
-    print("\n=== Results ===")
-    for result in results:
-        print(f"  {result['name']}: {result['status']}")
+    # 4. Controlla quali sembrano malevoli (controllo locale)
+    ip_malevoli = [ip for ip in ip_sospetti if controlla_ip_malevolo_locale(ip)]
     
-    print(f"\nTotal processed: {len(results)}")
-    logger.info("Application completed successfully")
-
+    # 5. Visualizza gli IP malevoli
+    visualizza_ip_malevoli(ip_malevoli)
+    
+    # 6. Opzionale: Controlla su VirusTotal
+    if ip_malevoli and VIRUSTOTAL_API_KEY != "YOUR_API_KEY_HERE":
+        print("\n🔍 Controllo su VirusTotal...")
+        scelta = input("\nVuoi controllare questi IP su VirusTotal? (s/n): ").lower()
+        
+        if scelta == 's':
+            for ip in ip_malevoli:
+                print(f"\nControllando {ip}...")
+                stats = controlla_su_virustotal(ip, VIRUSTOTAL_API_KEY)
+                if stats:
+                    malicious = stats.get('malicious', 0)
+                    suspicious = stats.get('suspicious', 0)
+                    print(f"  → Malevoli: {malicious}, Sospetti: {suspicious}")
+                time.sleep(15)  # Rate limiting VirusTotal (free tier: 4 req/min)
+    
+    print("\n✓ Controllo completato!")
 
 if __name__ == "__main__":
     main()
