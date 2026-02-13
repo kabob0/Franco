@@ -4,7 +4,7 @@ Script per filtrare indirizzi IP dalla whitelist e controllare quelli malevoli
 """
 
 import ipaddress
-import re
+import os
 from typing import List, Set
 import time
 
@@ -16,6 +16,13 @@ except ImportError:
 # Configurazione
 VIRUSTOTAL_API_KEY = "YOUR_API_KEY_HERE"  # Inserisci la tua chiave API di VirusTotal
 VIRUSTOTAL_URL = "https://www.virustotal.com/api/v3/ip_addresses/"
+
+def crea_file_template(file_path: str, contenuto: str) -> None:
+    """Crea un file template se non esiste"""
+    if not os.path.exists(file_path):
+        with open(file_path, 'w') as f:
+            f.write(contenuto)
+        print(f"✓ Creato file template: {file_path}")
 
 def carica_whitelist(file_path: str) -> Set[str]:
     """Carica gli IP dalla whitelist"""
@@ -114,6 +121,24 @@ def main():
     print("🛡️  IP MALICIOUS CHECKER")
     print("="*60)
     
+    # Template per i file di configurazione
+    whitelist_template = """# Whitelist di IP - Aggiungi un IP per riga
+# Le righe che iniziano con # vengono ignorate
+127.0.0.1
+8.8.8.8
+1.1.1.1
+"""
+    
+    ips_template = """# IP da controllare - Aggiungi un IP per riga
+# Le righe che iniziano con # vengono ignorate
+192.168.1.1
+10.0.0.1
+"""
+    
+    # Crea i file se non esistono
+    crea_file_template("whitelist.txt", whitelist_template)
+    crea_file_template("ips_to_check.txt", ips_template)
+    
     # 1. Carica la whitelist
     whitelist = carica_whitelist("whitelist.txt")
     
@@ -136,17 +161,24 @@ def main():
     # 6. Opzionale: Controlla su VirusTotal
     if ip_malevoli and VIRUSTOTAL_API_KEY != "YOUR_API_KEY_HERE":
         print("\n🔍 Controllo su VirusTotal...")
-        scelta = input("\nVuoi controllare questi IP su VirusTotal? (s/n): ").lower()
-        
-        if scelta == 's':
-            for ip in ip_malevoli:
-                print(f"\nControllando {ip}...")
-                stats = controlla_su_virustotal(ip, VIRUSTOTAL_API_KEY)
-                if stats:
-                    malicious = stats.get('malicious', 0)
-                    suspicious = stats.get('suspicious', 0)
-                    print(f"  → Malevoli: {malicious}, Sospetti: {suspicious}")
-                time.sleep(15)  # Rate limiting VirusTotal (free tier: 4 req/min)
+        try:
+            scelta = input("\nVuoi controllare questi IP su VirusTotal? (s/n): ").lower()
+            
+            if scelta == 's':
+                if requests is None:
+                    print("⚠ Pacchetto 'requests' non installato. Installa con: pip install requests")
+                    return
+                
+                for ip in ip_malevoli:
+                    print(f"\nControllando {ip}...")
+                    stats = controlla_su_virustotal(ip, VIRUSTOTAL_API_KEY)
+                    if stats:
+                        malicious = stats.get('malicious', 0)
+                        suspicious = stats.get('suspicious', 0)
+                        print(f"  → Malevoli: {malicious}, Sospetti: {suspicious}")
+                    time.sleep(15)  # Rate limiting VirusTotal (free tier: 4 req/min)
+        except KeyboardInterrupt:
+            print("\n\n⚠ Controllo interrotto dall'utente")
     
     print("\n✓ Controllo completato!")
 

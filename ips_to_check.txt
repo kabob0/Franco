@@ -1,0 +1,4 @@
+# IP da controllare - Aggiungi un IP per riga
+# Le righe che iniziano con # vengono ignorate
+192.168.1.1
+10.0.0.1
