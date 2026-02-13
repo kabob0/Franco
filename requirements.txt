@@ -1,7 +1,0 @@
-# Core dependencies
-# No external dependencies required for this basic version
-
-# Development dependencies
-pytest==7.4.3
-black==23.12.1
-pylint==3.0.3
