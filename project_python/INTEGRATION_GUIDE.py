@@ -214,7 +214,7 @@ Una volta configurato, testare così:
    cd project_python
    python main.py
    # → Dovrebbe caricare IP da:
-   #   1. File locale ips_to_check.txt
+    #   1. File locale contenente IP da verificare (uno per riga)
    #   2. Fonte esterna (se abilitata)
    #   3. Verificarli tutti contro VirusTotal
    ```
@@ -222,7 +222,7 @@ Una volta configurato, testare così:
 Esempio log atteso:
 ```
 [2025-02-17 14:30:10] INFO     | Elenco operazioni completate
-[2025-02-17 14:30:11] INFO     | Caricamenti da whit, blacklist, ips_to_check
+[2025-02-17 14:30:11] INFO     | Caricamenti da whitelist e blacklist (file locali)
 [2025-02-17 14:30:11] INFO     | Caricamento da fonte esterna: https://tonositosicurezza.com/api/ips
 [2025-02-17 14:30:12] INFO     | Caricati 42 IP da fonte esterna
 [2025-02-17 14:30:12] INFO     | Verificazione di 48 IP totali (6 locali + 42 esterni)

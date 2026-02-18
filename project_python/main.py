@@ -13,7 +13,7 @@ import logging
 import getpass
 import urllib.request
 import urllib.error
-from typing import Set, List, Dict, Optional, TextIO
+from typing import Set, List, Dict, Optional
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -29,36 +29,31 @@ SCRIPT_DIR = Path(__file__).parent
 CONFIG = {
     'VIRUSTOTAL_URL': 'https://www.virustotal.com/api/v3/ip_addresses/',
     'RATE_LIMIT_DELAY': 15,
-    'MALICIOUS_THRESHOLD': 5,
+    'MALICIOUS_THRESHOLD': 1,  # Blocca IP con 1+ rilevamenti
     'REQUEST_TIMEOUT': 10,
     'RETRY_COUNT': 2,
-    'USE_EXTERNAL_SOURCE': False,  # Disattivato per adesso
-    'EXTERNAL_SOURCE_URL': None,   # Sarà configurato dopo
+    'USE_RIPE_AS': True,
+    'RIPE_AS_NUMBER': 'AS16276',
+    'USE_RIPE_EXPAND': True,
+    'RIPE_EXPANSION_BLOCK_SIZE': 10,  # Test: blocchi da 10 IP
+    'RIPE_EXPANSION_MAX_WARN': 5000000,
+    'RIPE_FILTER_PREFIX': '151.245.54.0/24',  # Test network
 }
 
 FILE_PATHS = {
     'log': SCRIPT_DIR / 'ip_check.log',
     'whitelist': SCRIPT_DIR / 'whitelist.txt',
     'blacklist': SCRIPT_DIR / 'blacklist.txt',
-    'ips_to_check': SCRIPT_DIR / 'ips_to_check.txt',
 }
 
 # Configurazione logging
 def setup_logger(log_file: Path) -> logging.Logger:
-    """Configura logging standard con file e console"""
+    """Configura logging con file"""
     logger = logging.getLogger('ip_checker')
     logger.setLevel(logging.DEBUG)
-
-    # Handler file
-    file_handler = logging.FileHandler(log_file, encoding='utf-8', mode='a')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
-        '[%(asctime)s] %(levelname)-8s | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    file_handler.setFormatter(file_formatter)
-
-    logger.addHandler(file_handler)
+    handler = logging.FileHandler(log_file, encoding='utf-8', mode='a')
+    handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)-8s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(handler)
     return logger
 
 
@@ -77,67 +72,92 @@ class IpCheckResults:
 
 
 def chiedi_api_key() -> Optional[str]:
-    """
-    Chiede API key all'utente in modo sicuro usando getpass.
-    Valida la lunghezza (min 20 caratteri tipici VirusTotal).
-    """
-    print("\n🔐 API KEY VirusTotal (oppure premi INVIO per saltare):")
+    """Chiede API key VirusTotal (INVIO = chiave di test)"""
+    test_api_key = "5de14f31ce79d7f88b6420af21d14e26942780cc0bdb43d9c0df86447eabb4c5"  # Rimuovibile per produzione
+    prompt = "\n🔐 Inserisci API KEY VirusTotal (premi INVIO per chiave di test): "
     try:
-        api_key = getpass.getpass(">>> ").strip()
+        api_key = input(prompt).strip()
         if not api_key:
-            return None
+            print("ℹ️  Usando chiave di test per VirusTotal")
+            return test_api_key
         if len(api_key) >= 20:
+            print("ℹ️  Usando chiave VirusTotal fornita")
             return api_key
-        else:
-            print("⚠️  API key troppo corta (minimo 20 caratteri)")
-            return None
+        print("⚠️  Chiave inserita troppo corta (<20 car), uso chiave di test")
+        return test_api_key
     except (KeyboardInterrupt, EOFError):
-        print("\n⚠️  Input interrotto")
         return None
     except Exception as e:
-        print(f"❌ Errore lettura API key: {e}")
+        print(f"\n⚠️  Errore lettura API key: {e}")
         return None
 
 
 def carica_file(file_path: Path, logger: logging.Logger) -> Set[str]:
-    """
-    Carica indirizzi IP da file, ignorando commenti e linee vuote.
-
-    Args:
-        file_path: Percorso del file
-        logger: Logger per messaggi di debug
-
-    Returns:
-        Set di indirizzi IP validi
-    """
+    """Carica IP da file (ignora linee vuote e #commenti)"""
     try:
         if not file_path.exists():
-            print(f"⚠️  File non trovato: {file_path}")
             logger.warning(f"File non trovato: {file_path}")
             return set()
-
         with open(file_path, 'r', encoding='utf-8') as f:
             ips = {line.strip() for line in f if line.strip() and not line.startswith('#')}
-
         logger.info(f"Caricati {len(ips)} IP da {file_path.name}")
         return ips
-
     except Exception as e:
-        print(f"❌ Errore lettura {file_path.name}: {e}")
-        logger.error(f"Errore lettura {file_path.name}: {e}", exc_info=True)
+        logger.error(f"Errore lettura {file_path.name}: {e}")
         return set()
 
 
+def fetch_prefixes_from_ripe(asn: str, logger: logging.Logger) -> Set[str]:
+    """Recupera prefissi AS da RIPEstat API"""
+    if not asn:
+        return set()
+    url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource={asn}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "IP-Malicious-Checker/1.2"})
+        with urllib.request.urlopen(req, timeout=CONFIG['REQUEST_TIMEOUT']) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            prefixes = [item.get('prefix') for item in data.get('data', {}).get('prefixes', []) if item.get('prefix')]
+            prefixes = sorted(prefixes)
+            logger.info(f"RIPE: recuperati {len(prefixes)} prefissi per {asn}")
+            return set(prefixes)
+    except Exception as e:
+        logger.error(f"Errore RIPE {asn}: {e}")
+        return set()
+
+
+def _count_total_addresses(prefixes: Set[str]) -> int:
+    """Conta totale indirizzi IPv4 nei prefissi"""
+    total = 0
+    for p in prefixes:
+        try:
+            net = ipaddress.ip_network(p, strict=False)
+            if net.version == 4:
+                total += net.num_addresses
+            if total > 10**9:
+                return total
+        except:
+            continue
+    return total
+
+
+def generate_ip_blocks(prefixes: Set[str], block_size: int):
+    """Generatore di blocchi IP dai prefissi"""
+    current = []
+    for p in prefixes:
+        try:
+            for addr in ipaddress.ip_network(p, strict=False).hosts():
+                current.append(str(addr))
+                if len(current) >= block_size:
+                    yield current
+                    current = []
+        except:
+            continue
+    if current:
+        yield current
+
+
 def valida_ip(ip: str) -> bool:
-    """
-    Valida formato IPv4 o IPv6.
-
-    Args:
-        ip: Stringa indirizzo IP
-
-    Returns:
-        True se valido, False altrimenti
-    """
+    """Valida IPv4/IPv6"""
     try:
         ipaddress.ip_address(ip)
         return True
@@ -146,78 +166,45 @@ def valida_ip(ip: str) -> bool:
 
 
 def controlla_su_virustotal(ip: str, api_key: str, logger: logging.Logger) -> Optional[Dict]:
-    """
-    Controlla IP su VirusTotal con retry automatico.
-
-    Args:
-        ip: Indirizzo IP da controllare
-        api_key: API key VirusTotal
-        logger: Logger per debug
-
-    Returns:
-        Dict con statistics o None se errore
-    """
+    """Controlla IP su VirusTotal con retry"""
     if not api_key:
+        logger.warning(f"Nessuna API key disponibile per {ip}")
         return None
-
-    headers = {
-        "x-apikey": api_key,
-        "User-Agent": "IP-Malicious-Checker/1.2"
-    }
-
-    retry_count = CONFIG['RETRY_COUNT']
-    for tentativo in range(retry_count):
+    
+    headers = {"x-apikey": api_key, "User-Agent": "IP-Malicious-Checker/1.2"}
+    for tentativo in range(CONFIG['RETRY_COUNT']):
         try:
-            url = f"{CONFIG['VIRUSTOTAL_URL']}{ip}"
-            req = urllib.request.Request(url, headers=headers)
-
-            with urllib.request.urlopen(req, timeout=CONFIG['REQUEST_TIMEOUT']) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode('utf-8'))
+            req = urllib.request.Request(f"{CONFIG['VIRUSTOTAL_URL']}{ip}", headers=headers)
+            with urllib.request.urlopen(req, timeout=CONFIG['REQUEST_TIMEOUT']) as r:
+                if r.status == 200:
+                    data = json.loads(r.read().decode('utf-8'))
                     stats = data.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
                     logger.debug(f"VirusTotal {ip}: {stats}")
                     return stats
-
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                print("❌ API key non valida")
-                logger.error("API key VirusTotal non valida (401)")
+                logger.error(f"API key 401 Unauthorized per {ip} - Verifica validità chiave")
                 return None
-            elif e.code == 429:
-                # Rate limit
-                if tentativo < retry_count - 1:
-                    attesa = CONFIG['RATE_LIMIT_DELAY'] * (tentativo + 1)
-                    logger.warning(f"Rate limit VirusTotal, attesa {attesa}s...")
-                    time.sleep(attesa)
-                    continue
             elif e.code == 404:
-                logger.debug(f"IP {ip} non trovato su VirusTotal")
+                logger.debug(f"IP {ip} non trovato VirusTotal")
                 return {}
-            else:
-                logger.warning(f"HTTP {e.code} per {ip}: {e}")
-
-        except urllib.error.URLError as e:
-            if tentativo < retry_count - 1:
-                logger.warning(f"Errore connessione {ip}, tentativo {tentativo + 1}/{retry_count}")
+            elif e.code == 429 and tentativo < CONFIG['RETRY_COUNT'] - 1:
+                attesa = CONFIG['RATE_LIMIT_DELAY'] * (tentativo + 1)
+                logger.warning(f"Rate limit, attesa {attesa}s...")
+                time.sleep(attesa)
+        except urllib.error.URLError as ue:
+            if tentativo < CONFIG['RETRY_COUNT'] - 1:
+                logger.warning(f"Errore connessione {ip}, tentativo {tentativo + 1}: {ue}")
                 time.sleep(2 * (tentativo + 1))
-                continue
             else:
-                logger.error(f"Errore URLError permanente per {ip}: {e}")
-
+                logger.error(f"Errore URLError permanente {ip}: {ue}")
         except Exception as e:
-            logger.error(f"Errore VirusTotal per {ip}: {e}", exc_info=True)
-
+            logger.error(f"Errore VirusTotal {ip}: {e}")
     return None
 
 
 def scrivi_blacklist(ips_malevoli: List[tuple], logger: logging.Logger) -> None:
-    """
-    Scrive IP malevoli su blacklist file in batch per efficienza.
-
-    Args:
-        ips_malevoli: Lista di tuple (ip, motivo)
-        logger: Logger per debug
-    """
+    """Scrive IP malevoli su blacklist file in batch"""
     if not ips_malevoli:
         return
 
@@ -233,218 +220,166 @@ def scrivi_blacklist(ips_malevoli: List[tuple], logger: logging.Logger) -> None:
         logger.error(f"Errore salvataggio blacklist: {e}", exc_info=True)
 
 
-def carica_ips_da_fonte_esterna(url: str, logger: logging.Logger) -> Set[str]:
-    """
-    Carica indirizzi IP da una fonte esterna (es. form di login web).
-    DISATTIVATA per default - attivare con CONFIG['USE_EXTERNAL_SOURCE'] = True
-
-    Args:
-        url: URL della fonte esterna
-        logger: Logger per debug
-
-    Returns:
-        Set di indirizzi IP
-
-    Note:
-        Questa funzione sarà integrata con il sito di login fornito successivamente.
-        Supporterà POST/GET per retrievare lista IP dinamicamente.
-    """
-    if not CONFIG['USE_EXTERNAL_SOURCE']:
-        return set()
-
-    logger.info(f"Caricamento da fonte esterna: {url}")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "IP-Malicious-Checker/1.2"})
-        with urllib.request.urlopen(req, timeout=CONFIG['REQUEST_TIMEOUT']) as response:
-            content = response.read().decode('utf-8')
-            # TODO: Parse il formato della risposta (JSON, CSV, plaintext, ecc.)
-            # Esempio: se JSON con campo "ips"
-            # data = json.loads(content)
-            # return set(data.get('ips', []))
-            logger.warning("carica_ips_da_fonte_esterna: parser non implementato")
-            return set()
-
-    except Exception as e:
-        print(f"⚠️  Errore caricamento fonte esterna: {e}")
-        logger.error(f"Errore fonte esterna {url}: {e}", exc_info=True)
-        return set()
-
-
 def processa_ips(ips: Set[str], whitelist: Set[str], blacklist: Set[str],
                 api_key: Optional[str], logger: logging.Logger) -> IpCheckResults:
-    """
-    Processa lista di IP verificando contro whitelist/blacklist e VirusTotal.
-
-    Args:
-        ips: Set di IP da controllare
-        whitelist: Set di IP fidati
-        blacklist: Set di IP bloccati
-        api_key: API key VirusTotal (opzionale)
-        logger: Logger per debug
-
-    Returns:
-        IpCheckResults con classificazione IP
-    """
+    """Processa IP contro whitelist/blacklist e VirusTotal"""
     risultati = IpCheckResults()
     ips_malevoli = []
-    ips_ordinati = sorted(ips)
-    totale = len(ips_ordinati)
-
-    for idx, ip in enumerate(ips_ordinati, 1):
-        # Validazione
+    totale = len(ips)
+    
+    for idx, ip in enumerate(sorted(ips), 1):
         if not valida_ip(ip):
             print(f"⚠️  [{idx}/{totale}] {ip} - FORMATO INVALIDO")
             risultati.invalid.append(ip)
             logger.warning(f"IP invalido: {ip}")
-            continue
-
-        # Blacklist check
-        if ip in blacklist:
+        elif ip in blacklist:
             print(f"🚫 [{idx}/{totale}] {ip} - BLOCCATO (blacklist)")
             risultati.blacklist.append(ip)
             logger.info(f"{ip} - BLOCCATO (blacklist)")
-            continue
-
-        # Whitelist check
-        if ip in whitelist:
+        elif ip in whitelist:
             print(f"✅ [{idx}/{totale}] {ip} - WHITELIST")
             risultati.whitelist.append(ip)
             logger.info(f"{ip} - WHITELIST")
-            continue
-
-        # VirusTotal check
-        if api_key:
+        elif api_key:
             print(f"🔍 [{idx}/{totale}] {ip} - Verifica VirusTotal...", end=" ", flush=True)
             stats = controlla_su_virustotal(ip, api_key, logger)
-
-            if stats is not None:
-                malicious = stats.get('malicious', 0)
-                suspicious = stats.get('suspicious', 0)
-                total = malicious + suspicious
-
+            if stats:
+                total = stats.get('malicious', 0) + stats.get('suspicious', 0)
                 if total >= CONFIG['MALICIOUS_THRESHOLD']:
-                    print(f"❌ MALEVOLO ({malicious} rilevamenti)")
+                    print(f"❌ MALEVOLO ({total} rilevamenti)")
                     risultati.blacklist.append(ip)
-                    logger.warning(f"{ip} - MALEVOLO ({malicious} rilevamenti VirusTotal)")
-                    ips_malevoli.append((ip, f"Malevolo - {malicious} rilevamenti"))
+                    logger.warning(f"{ip} - MALEVOLO ({total} rilevamenti)")
+                    ips_malevoli.append((ip, f"Malevolo - {stats.get('malicious', 0)} rilevamenti"))
                 else:
                     print(f"✓ SICURO ({total} rilevamenti)")
                     risultati.allowed.append(ip)
-                    logger.info(f"{ip} - SICURO ({total} rilevamenti VirusTotal)")
+                    logger.info(f"{ip} - SICURO ({total} rilevamenti)")
             else:
                 print("⚠ Verifica fallita")
                 risultati.suspicious.append(ip)
                 logger.warning(f"{ip} - Verifica VirusTotal fallita")
-
             time.sleep(CONFIG['RATE_LIMIT_DELAY'])
         else:
             print(f"❓ [{idx}/{totale}] {ip} - SOSPETTO (nessuna API key)")
             risultati.suspicious.append(ip)
-            logger.info(f"{ip} - SOSPETTO (API key non fornita)")
-
-    # Salva batch di IP malevoli
+            logger.info(f"{ip} - SOSPETTO (nessuna API key)")
+    
     if ips_malevoli:
         scrivi_blacklist(ips_malevoli, logger)
-
     return risultati
 
 
 def stampa_report(risultati: IpCheckResults, logger: logging.Logger) -> None:
-    """
-    Stampa report formattato dei risultati.
-
-    Args:
-        risultati: IpCheckResults dal processing
-        logger: Logger per salvataggio
-    """
-    print("\n" + "="*70)
-    print("📊 REPORT FINALE")
-    print("="*70)
-
-    report_lines = [
+    """Stampa report risultati"""
+    lines = [
+        "\n" + "="*70,
+        "📊 REPORT FINALE",
+        "="*70,
         f"✅ Whitelist:      {len(risultati.whitelist):>3}",
         f"✓ Consentiti:      {len(risultati.allowed):>3}",
         f"❌ Bloccati:       {len(risultati.blacklist):>3}",
         f"❓ Sospetti:       {len(risultati.suspicious):>3}",
         f"⚠️  Invalidi:       {len(risultati.invalid):>3}",
         f"📊 TOTALE:         {risultati.total():>3}",
+        "="*70
     ]
-
-    for line in report_lines:
+    for line in lines:
         print(line)
-
-    print("="*70)
-
-    # Log report
-    for line in report_lines:
-        logger.info(line)
+        if line.startswith(("✅", "✓", "❌", "❓", "⚠️", "📊")):
+            logger.info(line)
 
 
 def main():
-    """Funzione principale - orchestrazione del flusso"""
+    """Orchestrazione controllo IP"""
     print("="*70)
     print("🛡️  IP MALICIOUS CHECKER v1.2")
     print("="*70)
-
+    
     try:
-        # Setup logging
         logger = setup_logger(FILE_PATHS['log'])
         logger.info("="*70)
-        logger.info(f"Avvio IP Malicious Checker v1.2 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Avvio v1.2 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("="*70)
-
-        # Chiedi API key
+        
         api_key = chiedi_api_key()
         if api_key:
-            logger.info("API key VirusTotal fornita")
+            print(f"✓ API key: {api_key[:10]}...{api_key[-10:]}")  # Mostra primi e ultimi 10 caratteri
+            logger.info(f"API key: {'fornita' if api_key else 'offline mode'}")
         else:
-            logger.info("Nessuna API key - verrà usata modalità offline")
-
-        # Carica file
+            print("❌ Nessuna API key disponibile")
+        
         print("\n📂 Caricamento dati...")
         whitelist = carica_file(FILE_PATHS['whitelist'], logger)
         blacklist = carica_file(FILE_PATHS['blacklist'], logger)
-        ips_da_controllare = carica_file(FILE_PATHS['ips_to_check'], logger)
-
-        # Carica da fonte esterna se abilitato
-        if CONFIG['USE_EXTERNAL_SOURCE'] and CONFIG['EXTERNAL_SOURCE_URL']:
-            ips_esterni = carica_ips_da_fonte_esterna(CONFIG['EXTERNAL_SOURCE_URL'], logger)
-            ips_da_controllare.update(ips_esterni)
-            logger.info(f"IP da fonte esterna: {len(ips_esterni)}")
-
-        # Validazione
-        if not ips_da_controllare:
-            print("❌ Nessun IP da controllare!")
-            logger.error("Nessun IP disponibile per il controllo")
-            return
-
         print(f"✓ Whitelist: {len(whitelist)} IP")
         print(f"✓ Blacklist: {len(blacklist)} IP")
-        print(f"✓ Da controllare: {len(ips_da_controllare)} IP")
-
-        # Processa IP
-        print("\n" + "="*70)
-        print("🔍 CONTROLLO IP")
-        print("="*70)
-
-        risultati = processa_ips(ips_da_controllare, whitelist, blacklist, api_key, logger)
-
-        # Stampa report
-        stampa_report(risultati, logger)
-
-        print(f"\n📝 Log salvato: {FILE_PATHS['log'].name}")
-        print("✓ Controllo completato!")
-
-        logger.info(f"Controllo completato - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        ripe_prefixes = set()
+        if CONFIG.get('USE_RIPE_AS') and CONFIG.get('RIPE_AS_NUMBER'):
+            ripe_prefixes = fetch_prefixes_from_ripe(CONFIG['RIPE_AS_NUMBER'], logger)
+            logger.info(f"RIPE AS {CONFIG['RIPE_AS_NUMBER']}: {len(ripe_prefixes)} prefissi")
+            print(f"✓ RIPE prefissi: {len(ripe_prefixes)}")
+            
+            if CONFIG.get('RIPE_FILTER_PREFIX'):
+                filter_prefix = CONFIG['RIPE_FILTER_PREFIX']
+                if any(p == filter_prefix for p in ripe_prefixes):
+                    ripe_prefixes = {filter_prefix}
+                    logger.info(f"Filter: {filter_prefix}")
+                    print(f"ℹ️  Filtro: {filter_prefix}")
+                else:
+                    ripe_prefixes = {filter_prefix}
+                    logger.info(f"Override: {filter_prefix}")
+                    print(f"ℹ️  Override: {filter_prefix}")
+        
+        if not ripe_prefixes or not CONFIG.get('USE_RIPE_EXPAND'):
+            print("❌ Nessun prefisso RIPE. Processo annullato.")
+            logger.error("Nessun prefisso RIPE o espansione disabilitata")
+            return
+        
+        total_ips = _count_total_addresses(ripe_prefixes)
+        if total_ips > int(CONFIG.get('RIPE_EXPANSION_MAX_WARN', 5000000)):
+            print(f"⚠️  {total_ips} indirizzi. Digitare YES per procedere: ", end="")
+            if input().strip().lower() not in ('yes', 'y', 'si', 's'):
+                print("❌ Annullato")
+                logger.info("Annullato per motivo di sicurezza")
+                return
+        
+        risultati_cumulativi = IpCheckResults()
+        block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 1024))
+        print("ℹ️  Premi CTRL-C per interrompere.")
+        
+        try:
+            for idx, block in enumerate(generate_ip_blocks(ripe_prefixes, block_size), 1):
+                if not CONFIG.get('AUTO_PROCESS_BLOCKS'):
+                    print(f"\n🔢 Blocco {idx} - {len(block)} IP. Premi INVIO (o 'q' per fermare): ", end="")
+                    if input().strip().lower() in ('q', 'quit'):
+                        print("❌ Interrotto")
+                        break
+                else:
+                    print(f"\n🔢 Blocco {idx} - {len(block)} IP. Processamento...")
+                
+                res = processa_ips(set(block), whitelist, blacklist, api_key, logger)
+                risultati_cumulativi.whitelist.extend(res.whitelist)
+                risultati_cumulativi.blacklist.extend(res.blacklist)
+                risultati_cumulativi.allowed.extend(res.allowed)
+                risultati_cumulativi.suspicious.extend(res.suspicious)
+                risultati_cumulativi.invalid.extend(res.invalid)
+        except KeyboardInterrupt:
+            print("\n⚠️  Interrotto")
+            logger.warning("Interrotto (KeyboardInterrupt)")
+        
+        stampa_report(risultati_cumulativi, logger)
+        print(f"\n📝 Log: {FILE_PATHS['log'].name}")
+        print("✓ Completato!")
+        logger.info(f"Completato - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("="*70)
-
+        
     except KeyboardInterrupt:
-        print("\n\n⚠️  Controllo interrotto dall'utente")
-        logger.warning("Esecuzione interrotta da utente (KeyboardInterrupt)")
-
+        print("\n⚠️  Interrotto")
+        logger.warning("Esecuzione interrotta")
     except Exception as e:
-        print(f"\n❌ Errore critico: {e}")
-        logger.critical(f"Errore critico durante esecuzione: {e}", exc_info=True)
+        print(f"\n❌ Errore: {e}")
+        logger.critical(f"Errore critico: {e}", exc_info=True)
         import traceback
         traceback.print_exc()
 

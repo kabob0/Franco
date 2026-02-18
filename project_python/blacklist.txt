@@ -1,3 +1,5 @@
-# Blacklist IP - indirizzi bloccati
-# Aggiunto automaticamente quando rilevato malevolo
-185.220.101.50  # Bloccato: 12 rilevamenti malevoli
+﻿# Blacklist - IP riconosciuti come malevoli da VirusTotal
+# Formato: uno per riga, indirizzi IPv4 validi
+# I commenti (# ...) vengono ignorati
+151.245.54.1  # Malevolo - 0 rilevamenti
+151.245.54.10  # Malevolo - 1 rilevamenti
