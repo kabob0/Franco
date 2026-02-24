@@ -37,13 +37,14 @@ CONFIG = {
     'USE_RIPE_EXPAND': True,
     'RIPE_EXPANSION_BLOCK_SIZE': 10,  # Test: blocchi da 10 IP
     'RIPE_EXPANSION_MAX_WARN': 5000000,
-    'RIPE_FILTER_PREFIX': '151.245.54.0/24',  # Filtro disattivato
+    #'RIPE_FILTER_PREFIX': '151.245.54.0/24',  # Filtro disattivato
 }
 
 FILE_PATHS = {
     'log': SCRIPT_DIR / 'ip_check.log',
     'whitelist': SCRIPT_DIR / 'whitelist.txt',
     'blacklist': SCRIPT_DIR / 'blacklist.txt',
+    'networks': SCRIPT_DIR / 'networks.txt',
 }
 
 # Configurazione logging
@@ -105,6 +106,85 @@ def carica_file(file_path: Path, logger: logging.Logger) -> Set[str]:
     except Exception as e:
         logger.error(f"Errore lettura {file_path.name}: {e}")
         return set()
+
+
+def carica_networks(file_path: Path, logger: logging.Logger) -> set:
+    """Carica reti/IP da networks.txt (supporta CIDR e IP singoli)."""
+    raw_values = carica_file(file_path, logger)
+    networks = set()
+
+    for value in raw_values:
+        try:
+            if '/' in value:
+                networks.add(ipaddress.ip_network(value, strict=False))
+            else:
+                ip_obj = ipaddress.ip_address(value)
+                if ip_obj.version == 4:
+                    networks.add(ipaddress.ip_network(f"{value}/32", strict=False))
+                else:
+                    networks.add(ipaddress.ip_network(f"{value}/128", strict=False))
+        except ValueError:
+            logger.warning(f"Networks.txt - valore non valido ignorato: {value}")
+
+    logger.info(f"Caricate {len(networks)} reti/IP validi da {file_path.name}")
+    return networks
+
+
+def filtra_prefissi_ripe_con_networks(prefixes: Set[str], target_networks: set,
+                                      logger: logging.Logger) -> Set[str]:
+    """Filtra prefissi RIPE mantenendo solo quelli che intersecano reti/IP target."""
+    if not target_networks:
+        logger.info("Nessun filtro da networks.txt: uso tutti i prefissi RIPE.")
+        return prefixes
+
+    filtered = set()
+    for prefix in prefixes:
+        try:
+            prefix_net = ipaddress.ip_network(prefix, strict=False)
+        except ValueError:
+            logger.warning(f"Prefisso RIPE non valido ignorato: {prefix}")
+            continue
+
+        for target in target_networks:
+            if prefix_net.version != target.version:
+                continue
+            if prefix_net.overlaps(target):
+                filtered.add(prefix)
+                break
+
+    logger.info(f"Filtro networks.txt applicato: {len(filtered)}/{len(prefixes)} prefissi RIPE mantenuti")
+    return filtered
+
+
+def _intersezione_reti_as(target_networks: set, as_prefixes: Set[str], logger: logging.Logger) -> Set[str]:
+    """Restituisce reti CIDR risultanti dall'intersezione tra networks.txt e prefissi AS RIPE."""
+    scoped_networks = set()
+    parsed_prefixes = []
+
+    for p in as_prefixes:
+        try:
+            parsed_prefixes.append(ipaddress.ip_network(p, strict=False))
+        except ValueError:
+            logger.warning(f"Prefisso RIPE non valido ignorato: {p}")
+
+    for target in target_networks:
+        for prefix_net in parsed_prefixes:
+            if target.version != prefix_net.version:
+                continue
+            if not target.overlaps(prefix_net):
+                continue
+
+            start_ip = max(int(target.network_address), int(prefix_net.network_address))
+            end_ip = min(int(target.broadcast_address), int(prefix_net.broadcast_address))
+            start_addr = ipaddress.ip_address(start_ip)
+            end_addr = ipaddress.ip_address(end_ip)
+            for net in ipaddress.summarize_address_range(start_addr, end_addr):
+                scoped_networks.add(str(net))
+
+    logger.info(
+        f"Scope finale networks.txt ∩ AS: {len(scoped_networks)} reti CIDR da processare"
+    )
+    return scoped_networks
 
 
 def fetch_prefixes_from_ripe(asn: str, logger: logging.Logger) -> Set[str]:
@@ -221,7 +301,8 @@ def scrivi_blacklist(ips_malevoli: List[tuple], logger: logging.Logger) -> None:
 
 
 def processa_ips(ips: Set[str], whitelist: Set[str], blacklist: Set[str],
-                api_key: Optional[str], logger: logging.Logger) -> IpCheckResults:
+                api_key: Optional[str], logger: logging.Logger,
+                source_tag: str = "RIPE") -> IpCheckResults:
     """Processa IP contro whitelist/blacklist e VirusTotal"""
     risultati = IpCheckResults()
     ips_malevoli = []
@@ -250,6 +331,7 @@ def processa_ips(ips: Set[str], whitelist: Set[str], blacklist: Set[str],
                     risultati.blacklist.append(ip)
                     logger.warning(f"{ip} - MALEVOLO ({total} rilevamenti)")
                     ips_malevoli.append((ip, f"Malevolo - {stats.get('malicious', 0)} rilevamenti"))
+                    logger.warning(f"[{source_tag}] MALEVOLO: {ip} | malicious={stats.get('malicious', 0)} suspicious={stats.get('suspicious', 0)}")
                 else:
                     print(f"✓ SICURO ({total} rilevamenti)")
                     risultati.allowed.append(ip)
@@ -311,14 +393,24 @@ def main():
         print("\n📂 Caricamento dati...")
         whitelist = carica_file(FILE_PATHS['whitelist'], logger)
         blacklist = carica_file(FILE_PATHS['blacklist'], logger)
+        network_filters = carica_networks(FILE_PATHS['networks'], logger)
         print(f"✓ Whitelist: {len(whitelist)} IP")
         print(f"✓ Blacklist: {len(blacklist)} IP")
+        print(f"✓ Networks.txt: {len(network_filters)} reti/IP validi")
         
+        if not network_filters:
+            print("❌ networks.txt non contiene reti/IP validi. Processo annullato.")
+            logger.error("Nessuna rete valida in networks.txt")
+            return
+
         ripe_prefixes = set()
+        reti_scope = set()
         if CONFIG.get('USE_RIPE_AS') and CONFIG.get('RIPE_AS_NUMBER'):
             ripe_prefixes = fetch_prefixes_from_ripe(CONFIG['RIPE_AS_NUMBER'], logger)
             logger.info(f"RIPE AS {CONFIG['RIPE_AS_NUMBER']}: {len(ripe_prefixes)} prefissi")
             print(f"✓ RIPE prefissi: {len(ripe_prefixes)}")
+            ripe_prefixes = filtra_prefissi_ripe_con_networks(ripe_prefixes, network_filters, logger)
+            print(f"✓ RIPE prefissi in overlap con networks.txt: {len(ripe_prefixes)}")
             
             if CONFIG.get('RIPE_FILTER_PREFIX'):
                 filter_prefix = CONFIG['RIPE_FILTER_PREFIX']
@@ -330,13 +422,16 @@ def main():
                     ripe_prefixes = {filter_prefix}
                     logger.info(f"Override: {filter_prefix}")
                     print(f"ℹ️  Override: {filter_prefix}")
+
+            reti_scope = _intersezione_reti_as(network_filters, ripe_prefixes, logger)
+            print(f"✓ Scope finale (networks.txt ∩ AS): {len(reti_scope)} reti")
         
-        if not ripe_prefixes or not CONFIG.get('USE_RIPE_EXPAND'):
-            print("❌ Nessun prefisso RIPE. Processo annullato.")
-            logger.error("Nessun prefisso RIPE o espansione disabilitata")
+        if not reti_scope or not CONFIG.get('USE_RIPE_EXPAND'):
+            print("❌ Nessuna rete target nello scope AS RIPE. Processo annullato.")
+            logger.error("Scope reti vuoto o espansione disabilitata")
             return
         
-        total_ips = _count_total_addresses(ripe_prefixes)
+        total_ips = _count_total_addresses(reti_scope)
         if total_ips > int(CONFIG.get('RIPE_EXPANSION_MAX_WARN', 5000000)):
             print(f"⚠️  {total_ips} indirizzi. Digitare YES per procedere: ", end="")
             if input().strip().lower() not in ('yes', 'y', 'si', 's'):
@@ -348,21 +443,21 @@ def main():
         block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 1024))
         
         # Stampa le reti che verranno espanse
-        print("\n🔧 Reti da espandere:")
-        for prefix in sorted(ripe_prefixes):
+        print("\n🔧 Reti da espandere (priorità networks.txt):")
+        for prefix in sorted(reti_scope):
             print(f"   - {prefix}")
         
         print("ℹ️  Premi CTRL-C per interrompere.")
         
         try:
-            for idx, block in enumerate(generate_ip_blocks(ripe_prefixes, block_size), 1):
+            for idx, block in enumerate(generate_ip_blocks(reti_scope, block_size), 1):
                 # Estrai informazioni di rete dal blocco
                 if block:
                     first_ip = ipaddress.ip_address(block[0])
                     last_ip = ipaddress.ip_address(block[-1])
                     # Trova il prefisso che contiene questi IP
                     network_info = None
-                    for prefix in ripe_prefixes:
+                    for prefix in reti_scope:
                         net = ipaddress.ip_network(prefix, strict=False)
                         if first_ip in net:
                             network_info = f"{net.network_address}/{net.prefixlen} ({net.num_addresses} indirizzi)"
@@ -381,7 +476,7 @@ def main():
                 else:
                     print(f"   Processamento...")
                 
-                res = processa_ips(set(block), whitelist, blacklist, api_key, logger)
+                res = processa_ips(set(block), whitelist, blacklist, api_key, logger, source_tag="NETWORKS_RIPE_SCOPE")
                 risultati_cumulativi.whitelist.extend(res.whitelist)
                 risultati_cumulativi.blacklist.extend(res.blacklist)
                 risultati_cumulativi.allowed.extend(res.allowed)
