@@ -37,7 +37,7 @@ CONFIG = {
     'USE_RIPE_EXPAND': True,
     'RIPE_EXPANSION_BLOCK_SIZE': 10,  # Test: blocchi da 10 IP
     'RIPE_EXPANSION_MAX_WARN': 5000000,
-    'RIPE_FILTER_PREFIX': '151.245.54.0/24',  # Test network
+    'RIPE_FILTER_PREFIX': '151.245.54.0/24',  # Filtro disattivato
 }
 
 FILE_PATHS = {
@@ -346,17 +346,40 @@ def main():
         
         risultati_cumulativi = IpCheckResults()
         block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 1024))
+        
+        # Stampa le reti che verranno espanse
+        print("\n🔧 Reti da espandere:")
+        for prefix in sorted(ripe_prefixes):
+            print(f"   - {prefix}")
+        
         print("ℹ️  Premi CTRL-C per interrompere.")
         
         try:
             for idx, block in enumerate(generate_ip_blocks(ripe_prefixes, block_size), 1):
+                # Estrai informazioni di rete dal blocco
+                if block:
+                    first_ip = ipaddress.ip_address(block[0])
+                    last_ip = ipaddress.ip_address(block[-1])
+                    # Trova il prefisso che contiene questi IP
+                    network_info = None
+                    for prefix in ripe_prefixes:
+                        net = ipaddress.ip_network(prefix, strict=False)
+                        if first_ip in net:
+                            network_info = f"{net.network_address}/{net.prefixlen} ({net.num_addresses} indirizzi)"
+                            break
+                    
+                    print(f"\n📡 Blocco {idx}")
+                    print(f"   Rete: {network_info if network_info else 'N/A'}")
+                    print(f"   Range: {first_ip} - {last_ip}")
+                    print(f"   IP nel blocco: {len(block)}")
+                
                 if not CONFIG.get('AUTO_PROCESS_BLOCKS'):
-                    print(f"\n🔢 Blocco {idx} - {len(block)} IP. Premi INVIO (o 'q' per fermare): ", end="")
+                    print(f"\n   Premi INVIO (o 'q' per fermare): ", end="")
                     if input().strip().lower() in ('q', 'quit'):
                         print("❌ Interrotto")
                         break
                 else:
-                    print(f"\n🔢 Blocco {idx} - {len(block)} IP. Processamento...")
+                    print(f"   Processamento...")
                 
                 res = processa_ips(set(block), whitelist, blacklist, api_key, logger)
                 risultati_cumulativi.whitelist.extend(res.whitelist)

@@ -3,3 +3,12 @@
 # I commenti (# ...) vengono ignorati
 151.245.54.1  # Malevolo - 0 rilevamenti
 151.245.54.10  # Malevolo - 1 rilevamenti
+151.245.54.1  # Malevolo - 0 rilevamenti
+151.245.54.10  # Malevolo - 1 rilevamenti
+151.245.54.29  # Malevolo - 5 rilevamenti
+151.245.54.65  # Malevolo - 0 rilevamenti
+151.245.54.89  # Malevolo - 1 rilevamenti
+151.245.54.181  # Malevolo - 9 rilevamenti
+151.245.54.190  # Malevolo - 0 rilevamenti
+151.245.54.1  # Malevolo - 0 rilevamenti
+151.245.54.10  # Malevolo - 1 rilevamenti
