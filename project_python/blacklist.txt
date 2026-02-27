@@ -85,3 +85,7 @@
 146.59.95.254  # Malevolo - 13 rilevamenti
 15.204.158.244  # Malevolo - 2 rilevamenti
 167.114.39.217  # Malevolo - 8 rilevamenti
+15.204.158.244  # Malevolo - 2 rilevamenti
+15.204.227.190  # Malevolo - 4 rilevamenti
+15.235.123.49  # Malevolo - 3 rilevamenti
+15.235.162.8  # Malevolo - 5 rilevamenti

@@ -41,7 +41,8 @@ CONFIG = {
 }
 
 FILE_PATHS = {
-    'log': SCRIPT_DIR / 'ip_check.log',
+    'log': SCRIPT_DIR / 'ip_check_debug.log',
+    'malicious_log': SCRIPT_DIR / 'ip_check.log',
     'whitelist': SCRIPT_DIR / 'whitelist.txt',
     'blacklist': SCRIPT_DIR / 'blacklist.txt',
     'networks': SCRIPT_DIR / 'networks.txt',
@@ -66,6 +67,7 @@ class IpCheckResults:
     allowed: List[str] = field(default_factory=list)
     suspicious: List[str] = field(default_factory=list)
     invalid: List[str] = field(default_factory=list)
+    malicious_details: List[Dict] = field(default_factory=list)
 
     def total(self) -> int:
         """Totale IP processati"""
@@ -220,20 +222,55 @@ def _count_total_addresses(prefixes: Set[str]) -> int:
     return total
 
 
-def generate_ip_blocks(prefixes: Set[str], block_size: int):
-    """Generatore di blocchi IP dai prefissi"""
+def conta_host_scansionabili(network: ipaddress._BaseNetwork) -> int:
+    """Conta host effettivamente scansionabili in una rete."""
+    if network.version == 4 and network.prefixlen < 31:
+        return max(network.num_addresses - 2, 0)
+    return network.num_addresses
+
+
+def generate_ip_blocks_for_network(network: ipaddress._BaseNetwork, block_size: int):
+    """Generatore di blocchi IP da una singola rete."""
     current = []
-    for p in prefixes:
-        try:
-            for addr in ipaddress.ip_network(p, strict=False).hosts():
-                current.append(str(addr))
-                if len(current) >= block_size:
-                    yield current
-                    current = []
-        except:
-            continue
+    for addr in network.hosts():
+        current.append(str(addr))
+        if len(current) >= block_size:
+            yield current
+            current = []
     if current:
         yield current
+
+
+def scrivi_log_malevoli_per_rete(file_path: Path, malevoli_per_rete: Dict[str, List[Dict]],
+                                 logger: logging.Logger) -> None:
+    """Scrive un report leggibile con soli IP malevoli, raggruppati per rete."""
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write("REPORT IP MALEVOLI PER RETE\n")
+            f.write("=" * 70 + "\n\n")
+
+            if not malevoli_per_rete:
+                f.write("Nessun IP malevolo rilevato.\n")
+                logger.info("Report malevoli: nessun IP malevolo rilevato")
+                return
+
+            for network in sorted(malevoli_per_rete.keys()):
+                f.write(f"Rete: {network}\n")
+                entries = malevoli_per_rete[network]
+                dedup = {}
+                for item in entries:
+                    dedup[item['ip']] = item
+
+                for ip in sorted(dedup.keys(), key=lambda x: ipaddress.ip_address(x)):
+                    item = dedup[ip]
+                    f.write(
+                        f"  - {ip} (malicious={item['malicious']}, suspicious={item['suspicious']}, total={item['total']})\n"
+                    )
+                f.write("\n")
+
+        logger.info(f"Report malevoli scritto su {file_path.name}")
+    except Exception as e:
+        logger.error(f"Errore scrittura report malevoli: {e}", exc_info=True)
 
 
 def valida_ip(ip: str) -> bool:
@@ -302,7 +339,7 @@ def scrivi_blacklist(ips_malevoli: List[tuple], logger: logging.Logger) -> None:
 
 def processa_ips(ips: Set[str], whitelist: Set[str], blacklist: Set[str],
                 api_key: Optional[str], logger: logging.Logger,
-                source_tag: str = "RIPE") -> IpCheckResults:
+                source_tag: str = "RIPE", parent_network: str = "") -> IpCheckResults:
     """Processa IP contro whitelist/blacklist e VirusTotal"""
     risultati = IpCheckResults()
     ips_malevoli = []
@@ -332,6 +369,13 @@ def processa_ips(ips: Set[str], whitelist: Set[str], blacklist: Set[str],
                     logger.warning(f"{ip} - MALEVOLO ({total} rilevamenti)")
                     ips_malevoli.append((ip, f"Malevolo - {stats.get('malicious', 0)} rilevamenti"))
                     logger.warning(f"[{source_tag}] MALEVOLO: {ip} | malicious={stats.get('malicious', 0)} suspicious={stats.get('suspicious', 0)}")
+                    risultati.malicious_details.append({
+                        'network': parent_network,
+                        'ip': ip,
+                        'malicious': stats.get('malicious', 0),
+                        'suspicious': stats.get('suspicious', 0),
+                        'total': total,
+                    })
                 else:
                     print(f"✓ SICURO ({total} rilevamenti)")
                     risultati.allowed.append(ip)
@@ -440,54 +484,69 @@ def main():
                 return
         
         risultati_cumulativi = IpCheckResults()
-        block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 1024))
-        
-        # Stampa le reti che verranno espanse
+        block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 10))
+        malevoli_per_rete: Dict[str, List[Dict]] = {}
+        reti_scope_obj = sorted(
+            [ipaddress.ip_network(p, strict=False) for p in reti_scope],
+            key=lambda n: (n.version, int(n.network_address), n.prefixlen)
+        )
+
         print("\n🔧 Reti da espandere (priorità networks.txt):")
-        for prefix in sorted(reti_scope):
-            print(f"   - {prefix}")
-        
+        for net in reti_scope_obj:
+            hosts = conta_host_scansionabili(net)
+            blocchi = (hosts + block_size - 1) // block_size if hosts else 0
+            print(f"   - {net} | host da verificare: {hosts} | blocchi da {block_size}: {blocchi}")
+
         print("ℹ️  Premi CTRL-C per interrompere.")
-        
+
         try:
-            for idx, block in enumerate(generate_ip_blocks(reti_scope, block_size), 1):
-                # Estrai informazioni di rete dal blocco
-                if block:
+            for rete_idx, net in enumerate(reti_scope_obj, 1):
+                hosts = conta_host_scansionabili(net)
+                blocchi = (hosts + block_size - 1) // block_size if hosts else 0
+                print(f"\n🌐 Rete [{rete_idx}/{len(reti_scope_obj)}]: {net} | host={hosts} | blocchi={blocchi}")
+                logger.info(f"Rete in lavorazione: {net} | host={hosts} | blocchi={blocchi}")
+
+                for block_idx, block in enumerate(generate_ip_blocks_for_network(net, block_size), 1):
                     first_ip = ipaddress.ip_address(block[0])
                     last_ip = ipaddress.ip_address(block[-1])
-                    # Trova il prefisso che contiene questi IP
-                    network_info = None
-                    for prefix in reti_scope:
-                        net = ipaddress.ip_network(prefix, strict=False)
-                        if first_ip in net:
-                            network_info = f"{net.network_address}/{net.prefixlen} ({net.num_addresses} indirizzi)"
-                            break
-                    
-                    print(f"\n📡 Blocco {idx}")
-                    print(f"   Rete: {network_info if network_info else 'N/A'}")
+                    print(f"\n📡 Blocco {block_idx}/{blocchi} - {net}")
                     print(f"   Range: {first_ip} - {last_ip}")
                     print(f"   IP nel blocco: {len(block)}")
-                
-                if not CONFIG.get('AUTO_PROCESS_BLOCKS'):
-                    print(f"\n   Premi INVIO (o 'q' per fermare): ", end="")
-                    if input().strip().lower() in ('q', 'quit'):
-                        print("❌ Interrotto")
-                        break
-                else:
-                    print(f"   Processamento...")
-                
-                res = processa_ips(set(block), whitelist, blacklist, api_key, logger, source_tag="NETWORKS_RIPE_SCOPE")
-                risultati_cumulativi.whitelist.extend(res.whitelist)
-                risultati_cumulativi.blacklist.extend(res.blacklist)
-                risultati_cumulativi.allowed.extend(res.allowed)
-                risultati_cumulativi.suspicious.extend(res.suspicious)
-                risultati_cumulativi.invalid.extend(res.invalid)
+
+                    if not CONFIG.get('AUTO_PROCESS_BLOCKS'):
+                        print("\n   Premi INVIO (o 'q' per fermare): ", end="")
+                        if input().strip().lower() in ('q', 'quit'):
+                            print("❌ Interrotto")
+                            raise KeyboardInterrupt
+                    else:
+                        print("   Processamento...")
+
+                    res = processa_ips(
+                        set(block),
+                        whitelist,
+                        blacklist,
+                        api_key,
+                        logger,
+                        source_tag="NETWORKS_RIPE_SCOPE",
+                        parent_network=str(net)
+                    )
+                    risultati_cumulativi.whitelist.extend(res.whitelist)
+                    risultati_cumulativi.blacklist.extend(res.blacklist)
+                    risultati_cumulativi.allowed.extend(res.allowed)
+                    risultati_cumulativi.suspicious.extend(res.suspicious)
+                    risultati_cumulativi.invalid.extend(res.invalid)
+                    risultati_cumulativi.malicious_details.extend(res.malicious_details)
+
+                    if res.malicious_details:
+                        malevoli_per_rete.setdefault(str(net), []).extend(res.malicious_details)
         except KeyboardInterrupt:
             print("\n⚠️  Interrotto")
             logger.warning("Interrotto (KeyboardInterrupt)")
-        
+
+        scrivi_log_malevoli_per_rete(FILE_PATHS['malicious_log'], malevoli_per_rete, logger)
         stampa_report(risultati_cumulativi, logger)
-        print(f"\n📝 Log: {FILE_PATHS['log'].name}")
+        print(f"\n📝 Log tecnico: {FILE_PATHS['log'].name}")
+        print(f"🧾 Log malevoli: {FILE_PATHS['malicious_log'].name}")
         print("✓ Completato!")
         logger.info(f"Completato - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("="*70)
