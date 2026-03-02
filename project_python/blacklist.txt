@@ -89,3 +89,15 @@
 15.204.227.190  # Malevolo - 4 rilevamenti
 15.235.123.49  # Malevolo - 3 rilevamenti
 15.235.162.8  # Malevolo - 5 rilevamenti
+15.204.158.244  # Malevolo - 2 rilevamenti
+15.204.227.190  # Malevolo - 4 rilevamenti
+15.235.123.49  # Malevolo - 3 rilevamenti
+15.235.162.8  # Malevolo - 6 rilevamenti
+37.59.110.4  # Malevolo - 12 rilevamenti
+51.38.51.165  # Malevolo - 1 rilevamenti
+51.38.98.14  # Malevolo - 11 rilevamenti
+51.38.224.114  # Malevolo - 9 rilevamenti
+51.38.226.254  # Malevolo - 3 rilevamenti
+51.68.10.4  # Malevolo - 3 rilevamenti
+51.68.226.87  # Malevolo - 11 rilevamenti
+51.75.27.166  # Malevolo - 4 rilevamenti

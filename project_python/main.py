@@ -110,10 +110,28 @@ def carica_file(file_path: Path, logger: logging.Logger) -> Set[str]:
         return set()
 
 
+def fetch_network_for_ip_from_ripe(ip: str, logger: logging.Logger) -> Optional[str]:
+    """Restituisce il prefisso RIPE associato a un IP singolo (es. 1.2.3.0/24)."""
+    url = f"https://stat.ripe.net/data/network-info/data.json?resource={ip}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "IP-Malicious-Checker/1.2"})
+        with urllib.request.urlopen(req, timeout=CONFIG['REQUEST_TIMEOUT']) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode('utf-8'))
+            prefix = data.get('data', {}).get('prefix')
+            if prefix:
+                return str(prefix)
+    except Exception as e:
+        logger.debug(f"RIPE network-info fallito per {ip}: {e}")
+    return None
+
+
 def carica_networks(file_path: Path, logger: logging.Logger) -> set:
     """Carica reti/IP da networks.txt (supporta CIDR e IP singoli)."""
     raw_values = carica_file(file_path, logger)
     networks = set()
+    cache_lookup = {}
 
     for value in raw_values:
         try:
@@ -121,10 +139,24 @@ def carica_networks(file_path: Path, logger: logging.Logger) -> set:
                 networks.add(ipaddress.ip_network(value, strict=False))
             else:
                 ip_obj = ipaddress.ip_address(value)
-                if ip_obj.version == 4:
-                    networks.add(ipaddress.ip_network(f"{value}/32", strict=False))
+                resolved_prefix = cache_lookup.get(value)
+                if resolved_prefix is None:
+                    resolved_prefix = fetch_network_for_ip_from_ripe(value, logger)
+                    cache_lookup[value] = resolved_prefix if resolved_prefix else ""
+
+                if resolved_prefix:
+                    net = ipaddress.ip_network(resolved_prefix, strict=False)
+                    if ip_obj in net:
+                        networks.add(net)
+                        logger.info(f"Networks.txt - {value} risolto via RIPE in {net}")
+                    else:
+                        fallback = f"{value}/32" if ip_obj.version == 4 else f"{value}/128"
+                        networks.add(ipaddress.ip_network(fallback, strict=False))
+                        logger.warning(f"Prefix RIPE non coerente per {value}, fallback a {fallback}")
                 else:
-                    networks.add(ipaddress.ip_network(f"{value}/128", strict=False))
+                    fallback = f"{value}/32" if ip_obj.version == 4 else f"{value}/128"
+                    networks.add(ipaddress.ip_network(fallback, strict=False))
+                    logger.info(f"Networks.txt - nessun prefix RIPE per {value}, fallback a {fallback}")
         except ValueError:
             logger.warning(f"Networks.txt - valore non valido ignorato: {value}")
 
