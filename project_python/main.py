@@ -13,7 +13,7 @@ import logging
 import getpass
 import urllib.request
 import urllib.error
-from typing import Set, List, Dict, Optional
+from typing import Set, List, Dict, Optional, Iterable
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -35,7 +35,7 @@ CONFIG = {
     'USE_RIPE_AS': True,
     'RIPE_AS_NUMBER': 'AS16276',
     'USE_RIPE_EXPAND': True,
-    'RIPE_EXPANSION_BLOCK_SIZE': 10,  # Test: blocchi da 10 IP
+    'RIPE_EXPANSION_BLOCK_SIZE': 10,  # Legacy: non usato (processo 1 blocco per rete)
     'RIPE_EXPANSION_MAX_WARN': 5000000,
     #'RIPE_FILTER_PREFIX': '151.245.54.0/24',  # Filtro disattivato
 }
@@ -128,35 +128,33 @@ def fetch_network_for_ip_from_ripe(ip: str, logger: logging.Logger) -> Optional[
 
 
 def carica_networks(file_path: Path, logger: logging.Logger) -> set:
-    """Carica reti/IP da networks.txt (supporta CIDR e IP singoli)."""
+    """Carica reti/IP da networks.txt e normalizza IPv4 in reti /24."""
     raw_values = carica_file(file_path, logger)
     networks = set()
-    cache_lookup = {}
 
     for value in raw_values:
         try:
             if '/' in value:
-                networks.add(ipaddress.ip_network(value, strict=False))
+                iface = ipaddress.ip_interface(value)
+                if iface.version == 4:
+                    net = ipaddress.ip_network(f"{iface.ip}/24", strict=False)
+                    networks.add(net)
+                    logger.info(f"Networks.txt - {value} normalizzato a {net}")
+                else:
+                    net = ipaddress.ip_network(value, strict=False)
+                    networks.add(net)
+                    logger.info(f"Networks.txt - {value} mantenuto come {net}")
             else:
                 ip_obj = ipaddress.ip_address(value)
-                resolved_prefix = cache_lookup.get(value)
-                if resolved_prefix is None:
-                    resolved_prefix = fetch_network_for_ip_from_ripe(value, logger)
-                    cache_lookup[value] = resolved_prefix if resolved_prefix else ""
-
-                if resolved_prefix:
-                    net = ipaddress.ip_network(resolved_prefix, strict=False)
-                    if ip_obj in net:
-                        networks.add(net)
-                        logger.info(f"Networks.txt - {value} risolto via RIPE in {net}")
-                    else:
-                        fallback = f"{value}/32" if ip_obj.version == 4 else f"{value}/128"
-                        networks.add(ipaddress.ip_network(fallback, strict=False))
-                        logger.warning(f"Prefix RIPE non coerente per {value}, fallback a {fallback}")
+                if ip_obj.version == 4:
+                    net = ipaddress.ip_network(f"{value}/24", strict=False)
+                    networks.add(net)
+                    logger.info(f"Networks.txt - {value} normalizzato a {net}")
                 else:
-                    fallback = f"{value}/32" if ip_obj.version == 4 else f"{value}/128"
-                    networks.add(ipaddress.ip_network(fallback, strict=False))
-                    logger.info(f"Networks.txt - nessun prefix RIPE per {value}, fallback a {fallback}")
+                    fallback = f"{value}/128"
+                    net = ipaddress.ip_network(fallback, strict=False)
+                    networks.add(net)
+                    logger.info(f"Networks.txt - {value} fallback IPv6 a {fallback}")
         except ValueError:
             logger.warning(f"Networks.txt - valore non valido ignorato: {value}")
 
@@ -255,22 +253,13 @@ def _count_total_addresses(prefixes: Set[str]) -> int:
 
 
 def conta_host_scansionabili(network: ipaddress._BaseNetwork) -> int:
-    """Conta host effettivamente scansionabili in una rete."""
-    if network.version == 4 and network.prefixlen < 31:
-        return max(network.num_addresses - 2, 0)
+    """Conta indirizzi scansionabili in una rete."""
     return network.num_addresses
 
 
-def generate_ip_blocks_for_network(network: ipaddress._BaseNetwork, block_size: int):
-    """Generatore di blocchi IP da una singola rete."""
-    current = []
-    for addr in network.hosts():
-        current.append(str(addr))
-        if len(current) >= block_size:
-            yield current
-            current = []
-    if current:
-        yield current
+def generate_ips_for_network(network: ipaddress._BaseNetwork) -> List[str]:
+    """Restituisce tutti gli IP di una rete."""
+    return [str(addr) for addr in network]
 
 
 def scrivi_log_malevoli_per_rete(file_path: Path, malevoli_per_rete: Dict[str, List[Dict]],
@@ -369,15 +358,16 @@ def scrivi_blacklist(ips_malevoli: List[tuple], logger: logging.Logger) -> None:
         logger.error(f"Errore salvataggio blacklist: {e}", exc_info=True)
 
 
-def processa_ips(ips: Set[str], whitelist: Set[str], blacklist: Set[str],
+def processa_ips(ips: Iterable[str], whitelist: Set[str], blacklist: Set[str],
                 api_key: Optional[str], logger: logging.Logger,
                 source_tag: str = "RIPE", parent_network: str = "") -> IpCheckResults:
     """Processa IP contro whitelist/blacklist e VirusTotal"""
     risultati = IpCheckResults()
     ips_malevoli = []
-    totale = len(ips)
+    ordered_ips = sorted(set(ips), key=lambda x: ipaddress.ip_address(x))
+    totale = len(ordered_ips)
     
-    for idx, ip in enumerate(sorted(ips), 1):
+    for idx, ip in enumerate(ordered_ips, 1):
         if not valida_ip(ip):
             print(f"⚠️  [{idx}/{totale}] {ip} - FORMATO INVALIDO")
             risultati.invalid.append(ip)
@@ -516,61 +506,51 @@ def main():
                 return
         
         risultati_cumulativi = IpCheckResults()
-        block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 10))
         malevoli_per_rete: Dict[str, List[Dict]] = {}
         reti_scope_obj = sorted(
             [ipaddress.ip_network(p, strict=False) for p in reti_scope],
             key=lambda n: (n.version, int(n.network_address), n.prefixlen)
         )
 
-        print("\n🔧 Reti da espandere (priorità networks.txt):")
+        print("\n🔧 Reti da espandere (1 blocco per rete):")
         for net in reti_scope_obj:
-            hosts = conta_host_scansionabili(net)
-            blocchi = (hosts + block_size - 1) // block_size if hosts else 0
-            print(f"   - {net} | host da verificare: {hosts} | blocchi da {block_size}: {blocchi}")
+            total_ips_rete = conta_host_scansionabili(net)
+            print(f"   - {net} | IP da verificare: {total_ips_rete} | blocchi: 1")
 
         print("ℹ️  Premi CTRL-C per interrompere.")
 
         try:
             for rete_idx, net in enumerate(reti_scope_obj, 1):
-                hosts = conta_host_scansionabili(net)
-                blocchi = (hosts + block_size - 1) // block_size if hosts else 0
-                print(f"\n🌐 Rete [{rete_idx}/{len(reti_scope_obj)}]: {net} | host={hosts} | blocchi={blocchi}")
-                logger.info(f"Rete in lavorazione: {net} | host={hosts} | blocchi={blocchi}")
+                total_ips_rete = conta_host_scansionabili(net)
+                ips_rete = generate_ips_for_network(net)
+                first_ip = ipaddress.ip_address(ips_rete[0])
+                last_ip = ipaddress.ip_address(ips_rete[-1])
+                print(f"\n🌐 Rete [{rete_idx}/{len(reti_scope_obj)}]: {net} | IP={total_ips_rete} | blocco=1")
+                print(f"   Range: {first_ip} - {last_ip}")
+                print(f"   IP nel blocco: {len(ips_rete)}")
+                logger.info(f"Rete in lavorazione: {net} | IP={total_ips_rete} | blocco=1")
 
-                for block_idx, block in enumerate(generate_ip_blocks_for_network(net, block_size), 1):
-                    first_ip = ipaddress.ip_address(block[0])
-                    last_ip = ipaddress.ip_address(block[-1])
-                    print(f"\n📡 Blocco {block_idx}/{blocchi} - {net}")
-                    print(f"   Range: {first_ip} - {last_ip}")
-                    print(f"   IP nel blocco: {len(block)}")
+                print("   Processamento...")
 
-                    if not CONFIG.get('AUTO_PROCESS_BLOCKS'):
-                        print("\n   Premi INVIO (o 'q' per fermare): ", end="")
-                        if input().strip().lower() in ('q', 'quit'):
-                            print("❌ Interrotto")
-                            raise KeyboardInterrupt
-                    else:
-                        print("   Processamento...")
+                res = processa_ips(
+                    ips_rete,
 
-                    res = processa_ips(
-                        set(block),
-                        whitelist,
-                        blacklist,
-                        api_key,
-                        logger,
-                        source_tag="NETWORKS_RIPE_SCOPE",
-                        parent_network=str(net)
-                    )
-                    risultati_cumulativi.whitelist.extend(res.whitelist)
-                    risultati_cumulativi.blacklist.extend(res.blacklist)
-                    risultati_cumulativi.allowed.extend(res.allowed)
-                    risultati_cumulativi.suspicious.extend(res.suspicious)
-                    risultati_cumulativi.invalid.extend(res.invalid)
-                    risultati_cumulativi.malicious_details.extend(res.malicious_details)
+                    whitelist,
+                    blacklist,
+                    api_key,
+                    logger,
+                    source_tag="NETWORKS_RIPE_SCOPE",
+                    parent_network=str(net)
+                )
+                risultati_cumulativi.whitelist.extend(res.whitelist)
+                risultati_cumulativi.blacklist.extend(res.blacklist)
+                risultati_cumulativi.allowed.extend(res.allowed)
+                risultati_cumulativi.suspicious.extend(res.suspicious)
+                risultati_cumulativi.invalid.extend(res.invalid)
+                risultati_cumulativi.malicious_details.extend(res.malicious_details)
 
-                    if res.malicious_details:
-                        malevoli_per_rete.setdefault(str(net), []).extend(res.malicious_details)
+                if res.malicious_details:
+                    malevoli_per_rete.setdefault(str(net), []).extend(res.malicious_details)
         except KeyboardInterrupt:
             print("\n⚠️  Interrotto")
             logger.warning("Interrotto (KeyboardInterrupt)")
