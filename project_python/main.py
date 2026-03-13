@@ -27,23 +27,47 @@ if sys.stdout.encoding != 'utf-8':
 # Configurazione
 SCRIPT_DIR = Path(__file__).parent
 CONFIG = {
+    # API VirusTotal
     'VIRUSTOTAL_URL': 'https://www.virustotal.com/api/v3/ip_addresses/',
-    'RATE_LIMIT_DELAY': 15,
-    'MALICIOUS_THRESHOLD': 1,  # Blocca IP con 1+ rilevamenti
     'REQUEST_TIMEOUT': 10,
     'RETRY_COUNT': 2,
-    'USE_RIPE_AS': True,
+    
+    # Rate limiting e timing
+    'RATE_LIMIT_DELAY': 15,  # Secondi di attesa tra richieste VirusTotal
+    
+    # Criteri di classificazione
+    'MALICIOUS_THRESHOLD': 1,  # Blocca IP con 1+ rilevamenti
+    
+    # Elaborazione blocchi
+    'BLOCK_SIZE': 255,  # Numero di IP per blocco (default: 254 usabili per /24, + 1 per sicurezza)
+    'AUTO_PROCESS_BLOCKS': False,  # True = skip della conferma tra blocchi, False = chiede conferma
+    'MAX_BATCHES': 0,  # 0 = illimitato, N = numero massimo di blocchi da processare
+    
+    # Output e logging
+    'VERBOSE_MODE': True,  # True = output dettagliato, False = output minimalista
+    'SAVE_RESULTS_JSON': True,  # Salva risultati in JSON
+    'SAVE_RESULTS_CSV': False,  # Salva risultati in CSV (non implementato ancora)
+    
+    # Ottimizzazioni
+    'SKIP_WHITELIST_CHECK': False,  # True = non controlla whitelist (per velocizzare)
+    'SKIP_BLACKLIST_CHECK': False,  # True = non controlla blacklist (usa solo VirusTotal)
+    'CACHE_ENABLED': True,  # True = sfrutta blacklist come cache
+    
+    # Limiti di sicurezza
+    'RIPE_EXPANSION_MAX_WARN': 5000000,  # Limite prima di chiedere conferma
+    
+    # LEGACY (mantenuti per compatibilità)
+    'USE_RIPE_AS': False,  # Disabilitato: usa input_ips.txt invece
     'RIPE_AS_NUMBER': 'AS16276',
-    'USE_RIPE_EXPAND': True,
-    'RIPE_EXPANSION_BLOCK_SIZE': 10,  # Test: blocchi da 10 IP
-    'RIPE_EXPANSION_MAX_WARN': 5000000,
-    'RIPE_FILTER_PREFIX': '151.245.54.0/24',  # Filtro disattivato
+    'RIPE_FILTER_PREFIX': '151.245.54.0/24',
 }
 
 FILE_PATHS = {
     'log': SCRIPT_DIR / 'ip_check.log',
     'whitelist': SCRIPT_DIR / 'whitelist.txt',
     'blacklist': SCRIPT_DIR / 'blacklist.txt',
+    'input_ips': SCRIPT_DIR / 'input_ips.txt',  # File di input per analisi reti /24
+    'results': SCRIPT_DIR / 'results.json',  # File risultati JSON
 }
 
 # Configurazione logging
@@ -55,8 +79,7 @@ def setup_logger(log_file: Path) -> logging.Logger:
     handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)-8s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
     logger.addHandler(handler)
     return logger
-
-
+ 
 @dataclass
 class IpCheckResults:
     """Risultati del controllo IP"""
@@ -65,6 +88,7 @@ class IpCheckResults:
     allowed: List[str] = field(default_factory=list)
     suspicious: List[str] = field(default_factory=list)
     invalid: List[str] = field(default_factory=list)
+    network_stats: Dict[str, Dict] = field(default_factory=dict)  # Stats per rete /24
 
     def total(self) -> int:
         """Totale IP processati"""
@@ -138,6 +162,35 @@ def _count_total_addresses(prefixes: Set[str]) -> int:
         except:
             continue
     return total
+
+
+def ips_to_networks_24(ips: Set[str], logger: logging.Logger) -> Set[str]:
+    """Converte una lista di IP nelle loro reti /24"""
+    networks = set()
+    for ip in ips:
+        try:
+            ip_obj = ipaddress.ip_address(ip.strip())
+            if ip_obj.version == 4:
+                # Crea una rete /24 che contiene l'IP
+                net = ipaddress.ip_network(f"{ip_obj}/24", strict=False)
+                networks.add(str(net))
+            else:
+                logger.warning(f"IP non IPv4 ignorato: {ip}")
+        except Exception as e:
+            logger.warning(f"IP non valido '{ip}': {e}")
+    return networks
+
+
+def get_network_24(ip: str) -> Optional[str]:
+    """Ottiene la rete /24 per un dato IP"""
+    try:
+        ip_obj = ipaddress.ip_address(ip.strip())
+        if ip_obj.version == 4:
+            net = ipaddress.ip_network(f"{ip_obj}/24", strict=False)
+            return str(net)
+    except Exception:
+        pass
+    return None
 
 
 def generate_ip_blocks(prefixes: Set[str], block_size: int):
@@ -228,49 +281,107 @@ def processa_ips(ips: Set[str], whitelist: Set[str], blacklist: Set[str],
     totale = len(ips)
     
     for idx, ip in enumerate(sorted(ips), 1):
+        network = get_network_24(ip)
+        
+        # Inizializza statistiche per rete se non esiste
+        if network and network not in risultati.network_stats:
+            risultati.network_stats[network] = {
+                'total': 0,
+                'whitelist': 0,
+                'blacklist': 0,
+                'allowed': 0,
+                'suspicious': 0,
+                'invalid': 0
+            }
+        
         if not valida_ip(ip):
             print(f"⚠️  [{idx}/{totale}] {ip} - FORMATO INVALIDO")
             risultati.invalid.append(ip)
+            if network:
+                risultati.network_stats[network]['invalid'] += 1
             logger.warning(f"IP invalido: {ip}")
         elif ip in blacklist:
             print(f"🚫 [{idx}/{totale}] {ip} - BLOCCATO (blacklist)")
             risultati.blacklist.append(ip)
+            if network:
+                risultati.network_stats[network]['blacklist'] += 1
             logger.info(f"{ip} - BLOCCATO (blacklist)")
         elif ip in whitelist:
             print(f"✅ [{idx}/{totale}] {ip} - WHITELIST")
             risultati.whitelist.append(ip)
+            if network:
+                risultati.network_stats[network]['whitelist'] += 1
             logger.info(f"{ip} - WHITELIST")
         elif api_key:
             print(f"🔍 [{idx}/{totale}] {ip} - Verifica VirusTotal...", end=" ", flush=True)
             stats = controlla_su_virustotal(ip, api_key, logger)
-            if stats:
+            if stats is not None:
                 total = stats.get('malicious', 0) + stats.get('suspicious', 0)
                 if total >= CONFIG['MALICIOUS_THRESHOLD']:
                     print(f"❌ MALEVOLO ({total} rilevamenti)")
                     risultati.blacklist.append(ip)
+                    if network:
+                        risultati.network_stats[network]['blacklist'] += 1
                     logger.warning(f"{ip} - MALEVOLO ({total} rilevamenti)")
                     ips_malevoli.append((ip, f"Malevolo - {stats.get('malicious', 0)} rilevamenti"))
                 else:
                     print(f"✓ SICURO ({total} rilevamenti)")
                     risultati.allowed.append(ip)
+                    if network:
+                        risultati.network_stats[network]['allowed'] += 1
                     logger.info(f"{ip} - SICURO ({total} rilevamenti)")
             else:
                 print("⚠ Verifica fallita")
                 risultati.suspicious.append(ip)
+                if network:
+                    risultati.network_stats[network]['suspicious'] += 1
                 logger.warning(f"{ip} - Verifica VirusTotal fallita")
             time.sleep(CONFIG['RATE_LIMIT_DELAY'])
         else:
             print(f"❓ [{idx}/{totale}] {ip} - SOSPETTO (nessuna API key)")
             risultati.suspicious.append(ip)
+            if network:
+                risultati.network_stats[network]['suspicious'] += 1
             logger.info(f"{ip} - SOSPETTO (nessuna API key)")
+        
+        if network and network in risultati.network_stats:
+            risultati.network_stats[network]['total'] += 1
     
     if ips_malevoli:
         scrivi_blacklist(ips_malevoli, logger)
     return risultati
 
 
-def stampa_report(risultati: IpCheckResults, logger: logging.Logger) -> None:
-    """Stampa report risultati"""
+def salva_risultati_json(risultati: IpCheckResults, networks: Set[str], logger: logging.Logger) -> None:
+    """Salva risultati in formato JSON"""
+    try:
+        output = {
+            'timestamp': datetime.now().isoformat(),
+            'networks_analizzate': sorted(list(networks)),
+            'statistiche_globali': {
+                'whitelist': len(risultati.whitelist),
+                'blacklist': len(risultati.blacklist),
+                'allowed': len(risultati.allowed),
+                'suspicious': len(risultati.suspicious),
+                'invalid': len(risultati.invalid),
+                'totale': risultati.total()
+            },
+            'statistiche_per_rete': risultati.network_stats,
+            'ips_malevoli': risultati.blacklist,
+            'ips_consentiti': risultati.allowed,
+            'ips_sospetti': risultati.suspicious
+        }
+        
+        with open(FILE_PATHS['results'], 'w', encoding='utf-8') as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Risultati salvati in {FILE_PATHS['results'].name}")
+    except Exception as e:
+        logger.error(f"Errore salvataggio JSON: {e}")
+
+
+def stampa_report(risultati: IpCheckResults, networks: Set[str], logger: logging.Logger) -> None:
+    """Stampa report risultati con statistiche per rete /24"""
     lines = [
         "\n" + "="*70,
         "📊 REPORT FINALE",
@@ -283,16 +394,32 @@ def stampa_report(risultati: IpCheckResults, logger: logging.Logger) -> None:
         f"📊 TOTALE:         {risultati.total():>3}",
         "="*70
     ]
+    
+    # Aggiungi statistiche per rete
+    if risultati.network_stats:
+        lines.extend([
+            "\n📡 STATISTICHE PER RETE /24",
+            "="*70
+        ])
+        for network in sorted(risultati.network_stats.keys()):
+            stats = risultati.network_stats[network]
+            lines.append(
+                f"{network:20} | Tot:{stats['total']:3} | OK:{stats['allowed']:3} | "
+                f"⚠️ :{stats['suspicious']:3} | ❌:{stats['blacklist']:3} | "
+                f"✅:{stats['whitelist']:3}"
+            )
+        lines.append("="*70)
+    
     for line in lines:
         print(line)
-        if line.startswith(("✅", "✓", "❌", "❓", "⚠️", "📊")):
+        if line.startswith(("✅", "✓", "❌", "❓", "⚠️", "📊", "📡")) or "=" in line:
             logger.info(line)
 
 
 def main():
-    """Orchestrazione controllo IP"""
+    """Orchestrazione controllo IP - Analizza IP da file e derives reti /24"""
     print("="*70)
-    print("🛡️  IP MALICIOUS CHECKER v1.2")
+    print("🛡️  IP MALICIOUS CHECKER v1.2 - RETE /24 ANALYZER")
     print("="*70)
     
     try:
@@ -301,42 +428,48 @@ def main():
         logger.info(f"Avvio v1.2 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("="*70)
         
+        # Richiedi API key
         api_key = chiedi_api_key()
         if api_key:
-            print(f"✓ API key: {api_key[:10]}...{api_key[-10:]}")  # Mostra primi e ultimi 10 caratteri
-            logger.info(f"API key: {'fornita' if api_key else 'offline mode'}")
+            print(f"✓ API key: {api_key[:10]}...{api_key[-10:]}")
+            logger.info(f"API key: fornita")
         else:
             print("❌ Nessuna API key disponibile")
+            logger.warning("API key non fornita - Modalità offline")
         
+        # Carica file di configurazione
         print("\n📂 Caricamento dati...")
         whitelist = carica_file(FILE_PATHS['whitelist'], logger)
         blacklist = carica_file(FILE_PATHS['blacklist'], logger)
+        input_ips = carica_file(FILE_PATHS['input_ips'], logger)
+        
         print(f"✓ Whitelist: {len(whitelist)} IP")
         print(f"✓ Blacklist: {len(blacklist)} IP")
+        print(f"✓ IP di input: {len(input_ips)} IP")
         
-        ripe_prefixes = set()
-        if CONFIG.get('USE_RIPE_AS') and CONFIG.get('RIPE_AS_NUMBER'):
-            ripe_prefixes = fetch_prefixes_from_ripe(CONFIG['RIPE_AS_NUMBER'], logger)
-            logger.info(f"RIPE AS {CONFIG['RIPE_AS_NUMBER']}: {len(ripe_prefixes)} prefissi")
-            print(f"✓ RIPE prefissi: {len(ripe_prefixes)}")
-            
-            if CONFIG.get('RIPE_FILTER_PREFIX'):
-                filter_prefix = CONFIG['RIPE_FILTER_PREFIX']
-                if any(p == filter_prefix for p in ripe_prefixes):
-                    ripe_prefixes = {filter_prefix}
-                    logger.info(f"Filter: {filter_prefix}")
-                    print(f"ℹ️  Filtro: {filter_prefix}")
-                else:
-                    ripe_prefixes = {filter_prefix}
-                    logger.info(f"Override: {filter_prefix}")
-                    print(f"ℹ️  Override: {filter_prefix}")
-        
-        if not ripe_prefixes or not CONFIG.get('USE_RIPE_EXPAND'):
-            print("❌ Nessun prefisso RIPE. Processo annullato.")
-            logger.error("Nessun prefisso RIPE o espansione disabilitata")
+        if not input_ips:
+            print("❌ Nessun IP trovato in input_ips.txt")
+            logger.error("Nessun IP trovato in input_ips.txt")
             return
         
-        total_ips = _count_total_addresses(ripe_prefixes)
+        # Derivi le reti /24 dagli IP di input
+        print("\n🔧 Derivazione reti /24...")
+        networks_24 = ips_to_networks_24(input_ips, logger)
+        print(f"✓ Reti /24 identificate: {len(networks_24)}")
+        
+        if not networks_24:
+            print("❌ Nessuna rete /24 potrebbe essere derivata")
+            logger.error("Nessuna rete /24 derivata")
+            return
+        
+        print("\n📡 Reti da analizzare:")
+        for net in sorted(networks_24):
+            print(f"   - {net}")
+        
+        # Conta totale IP
+        total_ips = _count_total_addresses(networks_24)
+        print(f"\n📊 Totale IP nelle reti: {total_ips}")
+        
         if total_ips > int(CONFIG.get('RIPE_EXPANSION_MAX_WARN', 5000000)):
             print(f"⚠️  {total_ips} indirizzi. Digitare YES per procedere: ", end="")
             if input().strip().lower() not in ('yes', 'y', 'si', 's'):
@@ -345,27 +478,24 @@ def main():
                 return
         
         risultati_cumulativi = IpCheckResults()
-        block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 1024))
+        block_size = int(CONFIG.get('RIPE_EXPANSION_BLOCK_SIZE', 255))
         
-        # Stampa le reti che verranno espanse
-        print("\n🔧 Reti da espandere:")
-        for prefix in sorted(ripe_prefixes):
-            print(f"   - {prefix}")
-        
-        print("ℹ️  Premi CTRL-C per interrompere.")
+        print("\nℹ️  Premi CTRL-C per interrompere.")
+        print("\n" + "="*70)
         
         try:
-            for idx, block in enumerate(generate_ip_blocks(ripe_prefixes, block_size), 1):
-                # Estrai informazioni di rete dal blocco
+            for idx, block in enumerate(generate_ip_blocks(networks_24, block_size), 1):
+                # Informazioni blocco
                 if block:
                     first_ip = ipaddress.ip_address(block[0])
                     last_ip = ipaddress.ip_address(block[-1])
-                    # Trova il prefisso che contiene questi IP
+                    
+                    # Trova la rete /24 che contiene questi IP
                     network_info = None
-                    for prefix in ripe_prefixes:
+                    for prefix in networks_24:
                         net = ipaddress.ip_network(prefix, strict=False)
                         if first_ip in net:
-                            network_info = f"{net.network_address}/{net.prefixlen} ({net.num_addresses} indirizzi)"
+                            network_info = str(net)
                             break
                     
                     print(f"\n📡 Blocco {idx}")
@@ -373,26 +503,36 @@ def main():
                     print(f"   Range: {first_ip} - {last_ip}")
                     print(f"   IP nel blocco: {len(block)}")
                 
-                if not CONFIG.get('AUTO_PROCESS_BLOCKS'):
-                    print(f"\n   Premi INVIO (o 'q' per fermare): ", end="")
-                    if input().strip().lower() in ('q', 'quit'):
-                        print("❌ Interrotto")
-                        break
-                else:
-                    print(f"   Processamento...")
-                
+                # Processing blocco
                 res = processa_ips(set(block), whitelist, blacklist, api_key, logger)
+                
+                # Accumula risultati
                 risultati_cumulativi.whitelist.extend(res.whitelist)
                 risultati_cumulativi.blacklist.extend(res.blacklist)
                 risultati_cumulativi.allowed.extend(res.allowed)
                 risultati_cumulativi.suspicious.extend(res.suspicious)
                 risultati_cumulativi.invalid.extend(res.invalid)
+                
+                # Merge network stats
+                for net, stats in res.network_stats.items():
+                    if net in risultati_cumulativi.network_stats:
+                        for key in stats:
+                            risultati_cumulativi.network_stats[net][key] += stats[key]
+                    else:
+                        risultati_cumulativi.network_stats[net] = stats
+        
         except KeyboardInterrupt:
             print("\n⚠️  Interrotto")
             logger.warning("Interrotto (KeyboardInterrupt)")
         
-        stampa_report(risultati_cumulativi, logger)
+        # Stampa report finale
+        stampa_report(risultati_cumulativi, networks_24, logger)
+        
+        # Salva risultati
+        salva_risultati_json(risultati_cumulativi, networks_24, logger)
+        
         print(f"\n📝 Log: {FILE_PATHS['log'].name}")
+        print(f"📊 Risultati JSON: {FILE_PATHS['results'].name}")
         print("✓ Completato!")
         logger.info(f"Completato - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("="*70)
